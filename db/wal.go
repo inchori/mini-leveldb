@@ -34,11 +34,11 @@ func NewWAL(dir string) (*WAL, error) {
 }
 
 func (w *WAL) Append(key, value string) error {
-	if w.file == nil {
+	if w.writer == nil {
 		return os.ErrInvalid
 	}
 
-	_, err := w.file.WriteString(key + "=" + value + "\n")
+	_, err := w.writer.WriteString(key + "=" + value + "\n")
 	if err != nil {
 		return fmt.Errorf("failed to append to WAL: %w", err)
 	}

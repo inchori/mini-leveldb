@@ -37,3 +37,6 @@ build/
 
 # Data files
 data/
+
+# Coverage reports
+coverage/

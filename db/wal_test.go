@@ -48,6 +48,6 @@ func TestWALAppendAndReplay(t *testing.T) {
 
 	for _, tt := range tests {
 		got := result[tt.key]
-		assert.Containsf(t, tt.value, got, "Replay should return the correct value for key %s", tt.key)
+		assert.Equalf(t, tt.value, got, "Replay should return the correct value for key %s", tt.key)
 	}
 }
