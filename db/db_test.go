@@ -2,13 +2,25 @@ package db_test
 
 import (
 	"mini-leveldb/db"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func TestDBGetAndPut(t *testing.T) {
-	store := db.NewDB()
+	dir := "testdata/wal"
+	_ = os.RemoveAll(dir)
+
+	store, err := db.NewDB(dir)
+	assert.NoError(t, err)
+
+	t.Cleanup(func() {
+		store.Close()
+		os.RemoveAll(dir)
+		os.RemoveAll("testdata")
+	})
+
 	_ = store.Put("foo", "bar")
 
 	tests := []struct {
