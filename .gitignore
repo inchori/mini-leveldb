@@ -34,3 +34,6 @@ Thumbs.db
 # Compiled binary
 bin/
 build/
+
+# Data files
+data/
