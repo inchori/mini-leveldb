@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -26,22 +27,26 @@ func NewDB(dir string) (*DB, error) {
 		return nil, fmt.Errorf("failed to create WAL: %w", err)
 	}
 
-	files, err := filepath.Glob(filepath.Join(dir, "*.sst"))
-	if err != nil {
-		return nil, fmt.Errorf("failed to list SSTable files: %w", err)
-	}
-	sort.Strings(files)
-
-	var ssTables []*SSTable
-	for _, file := range files {
-		ssTables = append(ssTables, &SSTable{path: file})
-	}
-
-	return &DB{
+	db := &DB{
 		memTable: memTable,
 		wal:      wal,
-		ssTables: ssTables,
-	}, nil
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read director: %w", err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".sst") {
+			sst := &SSTable{path: filepath.Join(dir, entry.Name())}
+			if err := sst.Load(); err != nil {
+				return nil, fmt.Errorf("failed to load SSTable %s: %w", entry.Name(), err)
+			}
+			db.ssTables = append(db.ssTables, sst)
+		}
+	}
+
+	return db, nil
 }
 
 func (db *DB) Get(key string) (string, error) {
@@ -50,7 +55,7 @@ func (db *DB) Get(key string) (string, error) {
 	}
 
 	for i := len(db.ssTables) - 1; i >= 0; i-- {
-		if value, ok := db.ssTables[i].Search(key); ok {
+		if value, ok := db.ssTables[i].BinarySearch(key); ok {
 			return value, nil
 		}
 	}
@@ -87,6 +92,10 @@ func (db *DB) Flush(dir string) error {
 	sst := &SSTable{path: ssTablePath}
 	if err := sst.Write(kvs); err != nil {
 		return fmt.Errorf("failed to write SSTable: %w", err)
+	}
+
+	if err := sst.Load(); err != nil {
+		return fmt.Errorf("failed to load SSTable after writing: %w", err)
 	}
 
 	if err := db.wal.Close(); err != nil {

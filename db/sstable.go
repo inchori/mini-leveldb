@@ -3,9 +3,11 @@ package db
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -19,8 +21,7 @@ type SSTable struct {
 	index []indexEntry
 }
 
-// TODO: Apply Binary Search for better performance
-func (s *SSTable) Search(key string) (string, bool) {
+func (s *SSTable) LinearSearch(key string) (string, bool) {
 	if key == "" {
 		return "", false
 	}
@@ -45,6 +46,41 @@ func (s *SSTable) Search(key string) (string, bool) {
 	return "", false
 }
 
+func (s *SSTable) BinarySearch(key string) (string, bool) {
+	if len(s.index) == 0 || key == "" {
+		return "", false
+	}
+
+	i := sort.Search(len(s.index), func(i int) bool {
+		return s.index[i].key >= key
+	})
+	if i == len(s.index) || s.index[i].key != key {
+		return "", false
+	}
+	off := s.index[i].offset
+
+	file, err := os.Open(s.path)
+	if err != nil {
+		return "", false
+	}
+	defer file.Close()
+
+	if _, err := file.Seek(off, io.SeekStart); err != nil {
+		return "", false
+	}
+
+	k, err := readString(file)
+	if err != nil || k != key {
+		return "", false
+	}
+
+	v, err := readString(file)
+	if err != nil {
+		return "", false
+	}
+	return v, true
+}
+
 func (s *SSTable) Write(kvs [][2]string) error {
 	file, err := os.Create(s.path)
 	if err != nil {
@@ -52,8 +88,13 @@ func (s *SSTable) Write(kvs [][2]string) error {
 	}
 	defer file.Close()
 
+	s.index = nil
+
 	for _, kv := range kvs {
-		offset, _ := file.Seek(0, io.SeekCurrent)
+		offset, err := file.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return fmt.Errorf("failed to seek in SSTable file: %w", err)
+		}
 		if err := writeString(file, kv[0]); err != nil {
 			return fmt.Errorf("failed to write key: %w", err)
 		}
@@ -67,7 +108,10 @@ func (s *SSTable) Write(kvs [][2]string) error {
 		})
 	}
 
-	indexOffset, _ := file.Seek(0, io.SeekCurrent)
+	indexOffset, err := file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return fmt.Errorf("failed to seek to index offset: %w", err)
+	}
 	for _, entry := range s.index {
 		if err := writeString(file, entry.key); err != nil {
 			return fmt.Errorf("failed to write index key: %w", err)
@@ -110,6 +154,10 @@ func (s *SSTable) Load() error {
 		return fmt.Errorf("failed to read index offset: %w", err)
 	}
 
+	if indexOffset < 0 || indexOffset >= stat.Size()-8 {
+		return fmt.Errorf("invalid index offset: %d", indexOffset)
+	}
+
 	_, err = file.Seek(indexOffset, io.SeekStart)
 	if err != nil {
 		return fmt.Errorf("failed to seek to index: %w", err)
@@ -118,7 +166,7 @@ func (s *SSTable) Load() error {
 	s.index = nil
 	for {
 		key, err := readString(file)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			break
 		}
 		if err != nil {
@@ -137,24 +185,4 @@ func (s *SSTable) Load() error {
 	}
 
 	return nil
-}
-
-func readString(r io.Reader) (string, error) {
-	var length int32
-	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
-		return "", err
-	}
-	buf := make([]byte, length)
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return "", err
-	}
-	return string(buf), nil
-}
-
-func writeString(w io.Writer, str string) error {
-	if err := binary.Write(w, binary.LittleEndian, int32(len(str))); err != nil {
-		return err
-	}
-	_, err := w.Write([]byte(str))
-	return err
 }
