@@ -9,7 +9,7 @@ import (
 )
 
 func TestDBGetAndPut(t *testing.T) {
-	dir := "testdata/wal"
+	dir := "testdata"
 	_ = os.RemoveAll(dir)
 
 	store, err := db.NewDB(dir)
@@ -22,6 +22,9 @@ func TestDBGetAndPut(t *testing.T) {
 	})
 
 	_ = store.Put("foo", "bar")
+
+	err = store.Flush(dir)
+	assert.NoError(t, err)
 
 	tests := []struct {
 		name    string

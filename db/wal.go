@@ -15,11 +15,12 @@ type WAL struct {
 }
 
 func NewWAL(dir string) (*WAL, error) {
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	walDataPath := filepath.Join(dir, "wal")
+	if err := os.MkdirAll(walDataPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create WAL directory: %w", err)
 	}
 
-	filePath := filepath.Join(dir, "wal.log")
+	filePath := filepath.Join(walDataPath, "wal.log")
 	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open WAL file: %w", err)
