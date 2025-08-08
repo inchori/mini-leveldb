@@ -3,7 +3,7 @@ package db
 import (
 	"fmt"
 	"log"
-	"path"
+	"os"
 	"path/filepath"
 	"sort"
 	"time"
@@ -83,7 +83,7 @@ func (db *DB) Flush(dir string) error {
 	}
 
 	filename := fmt.Sprintf("sstable_%d.sst", time.Now().UnixNano())
-	ssTablePath := path.Join(dir, filename)
+	ssTablePath := filepath.Join(dir, filename)
 	sst := &SSTable{path: ssTablePath}
 	if err := sst.Write(kvs); err != nil {
 		return fmt.Errorf("failed to write SSTable: %w", err)
@@ -91,6 +91,10 @@ func (db *DB) Flush(dir string) error {
 
 	if err := db.wal.Close(); err != nil {
 		return fmt.Errorf("failed to close WAL: %w", err)
+	}
+
+	if err := os.Remove(walFilePath(dir)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove old WAL during rollover: %w", err)
 	}
 
 	newWal, err := NewWAL(dir)
