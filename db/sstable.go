@@ -17,8 +17,9 @@ type indexEntry struct {
 }
 
 type SSTable struct {
-	path  string
-	index []indexEntry
+	path   string
+	index  []indexEntry
+	filter *BloomFilter
 }
 
 func (s *SSTable) LinearSearch(key string) (string, bool) {
@@ -47,7 +48,7 @@ func (s *SSTable) LinearSearch(key string) (string, bool) {
 }
 
 func (s *SSTable) BinarySearch(key string) (string, bool) {
-	if len(s.index) == 0 || key == "" {
+	if s.filter != nil && !s.filter.MightContains(key) {
 		return "", false
 	}
 
@@ -88,6 +89,8 @@ func (s *SSTable) Write(kvs [][2]string) error {
 	}
 	defer file.Close()
 
+	s.filter = NewBloomFilter(uint(len(kvs)), 0.01)
+
 	s.index = nil
 
 	for _, kv := range kvs {
@@ -102,10 +105,23 @@ func (s *SSTable) Write(kvs [][2]string) error {
 			return fmt.Errorf("failed to write value: %w", err)
 		}
 
+		s.filter.Add(kv[0])
+
 		s.index = append(s.index, indexEntry{
 			key:    kv[0],
 			offset: offset,
 		})
+	}
+
+	filterOffset, err := file.Seek(0, io.SeekCurrent)
+	if err := writeBytes(file, s.filter.bitset); err != nil {
+		return fmt.Errorf("failed to write bloom filter: %w", err)
+	}
+	if err := binary.Write(file, binary.LittleEndian, s.filter.m); err != nil {
+		return fmt.Errorf("failed to write bloom filter size: %w", err)
+	}
+	if err := binary.Write(file, binary.LittleEndian, s.filter.k); err != nil {
+		return fmt.Errorf("failed to write bloom filter hash count: %w", err)
 	}
 
 	indexOffset, err := file.Seek(0, io.SeekCurrent)
@@ -121,8 +137,12 @@ func (s *SSTable) Write(kvs [][2]string) error {
 		}
 	}
 
+	// Write the footer with index and filter offsets
 	if err := binary.Write(file, binary.LittleEndian, indexOffset); err != nil {
 		return fmt.Errorf("failed to write footer: %w", err)
+	}
+	if err := binary.Write(file, binary.LittleEndian, filterOffset); err != nil {
+		return fmt.Errorf("failed to write filter offset: %w", err)
 	}
 
 	return nil
@@ -139,24 +159,38 @@ func (s *SSTable) Load() error {
 	if err != nil {
 		return fmt.Errorf("failed to get file stats: %w", err)
 	}
-
-	if stat.Size() < 8 {
+	if stat.Size() < 16 {
 		return fmt.Errorf("SSTable file is too small: %s", s.path)
 	}
 
-	_, err = file.Seek(-8, io.SeekEnd)
+	_, err = file.Seek(-16, io.SeekEnd)
 	if err != nil {
 		return fmt.Errorf("failed to seek to footer: %w", err)
 	}
 
-	var indexOffset int64
+	var indexOffset, filterOffset int64
 	if err := binary.Read(file, binary.LittleEndian, &indexOffset); err != nil {
 		return fmt.Errorf("failed to read index offset: %w", err)
 	}
-
-	if indexOffset < 0 || indexOffset >= stat.Size()-8 {
-		return fmt.Errorf("invalid index offset: %d", indexOffset)
+	if err := binary.Read(file, binary.LittleEndian, &filterOffset); err != nil {
+		return fmt.Errorf("failed to read filter offset: %w", err)
 	}
+
+	if _, err := file.Seek(filterOffset, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek to bloom filter: %w", err)
+	}
+	bits, err := readBytes(file)
+	if err != nil {
+		return fmt.Errorf("failed to read bloom bits: %w", err)
+	}
+	var m, k uint
+	if err := binary.Read(file, binary.LittleEndian, &m); err != nil {
+		return fmt.Errorf("failed to read bloom m: %w", err)
+	}
+	if err := binary.Read(file, binary.LittleEndian, &k); err != nil {
+		return fmt.Errorf("failed to read bloom k: %w", err)
+	}
+	s.filter = &BloomFilter{bitset: bits, m: m, k: k}
 
 	_, err = file.Seek(indexOffset, io.SeekStart)
 	if err != nil {

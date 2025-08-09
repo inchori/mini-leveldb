@@ -23,7 +23,7 @@ func TestDBGetAndPut(t *testing.T) {
 
 	_ = store.Put("foo", "bar")
 
-	err = store.Flush(dir)
+	err = store.Flush()
 	assert.NoError(t, err)
 
 	tests := []struct {
