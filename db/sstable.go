@@ -114,13 +114,16 @@ func (s *SSTable) Write(kvs [][2]string) error {
 	}
 
 	filterOffset, err := file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return fmt.Errorf("failed to seek to filter offset: %w", err)
+	}
 	if err := writeBytes(file, s.filter.bitset); err != nil {
 		return fmt.Errorf("failed to write bloom filter: %w", err)
 	}
-	if err := binary.Write(file, binary.LittleEndian, s.filter.m); err != nil {
+	if err := binary.Write(file, binary.LittleEndian, uint64(s.filter.m)); err != nil {
 		return fmt.Errorf("failed to write bloom filter size: %w", err)
 	}
-	if err := binary.Write(file, binary.LittleEndian, s.filter.k); err != nil {
+	if err := binary.Write(file, binary.LittleEndian, uint64(s.filter.k)); err != nil {
 		return fmt.Errorf("failed to write bloom filter hash count: %w", err)
 	}
 
@@ -183,14 +186,14 @@ func (s *SSTable) Load() error {
 	if err != nil {
 		return fmt.Errorf("failed to read bloom bits: %w", err)
 	}
-	var m, k uint
-	if err := binary.Read(file, binary.LittleEndian, &m); err != nil {
+	var m64, k64 uint64
+	if err := binary.Read(file, binary.LittleEndian, &m64); err != nil {
 		return fmt.Errorf("failed to read bloom m: %w", err)
 	}
-	if err := binary.Read(file, binary.LittleEndian, &k); err != nil {
+	if err := binary.Read(file, binary.LittleEndian, &k64); err != nil {
 		return fmt.Errorf("failed to read bloom k: %w", err)
 	}
-	s.filter = &BloomFilter{bitset: bits, m: m, k: k}
+	s.filter = &BloomFilter{bitset: bits, m: uint(m64), k: uint(k64)}
 
 	_, err = file.Seek(indexOffset, io.SeekStart)
 	if err != nil {
