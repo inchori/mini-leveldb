@@ -20,6 +20,7 @@ type SSTable struct {
 	path   string
 	index  []indexEntry
 	filter *BloomFilter
+	file   *os.File
 }
 
 func (s *SSTable) LinearSearch(key string) (string, bool) {
@@ -48,7 +49,11 @@ func (s *SSTable) LinearSearch(key string) (string, bool) {
 }
 
 func (s *SSTable) BinarySearch(key string) (string, bool) {
-	if s.filter != nil && !s.filter.MightContains(key) {
+	if s.file == nil {
+		return "", false
+	}
+
+	if s.filter != nil && !s.filter.MayContain(key) {
 		return "", false
 	}
 
@@ -60,23 +65,8 @@ func (s *SSTable) BinarySearch(key string) (string, bool) {
 	}
 	off := s.index[i].offset
 
-	file, err := os.Open(s.path)
-	if err != nil {
-		return "", false
-	}
-	defer file.Close()
-
-	if _, err := file.Seek(off, io.SeekStart); err != nil {
-		return "", false
-	}
-
-	k, err := readString(file)
-	if err != nil || k != key {
-		return "", false
-	}
-
-	v, err := readString(file)
-	if err != nil {
+	k, v, ok := readKVAt(s.file, off)
+	if !ok || k != key {
 		return "", false
 	}
 	return v, true
@@ -120,10 +110,12 @@ func (s *SSTable) Write(kvs [][2]string) error {
 	if err := writeBytes(file, s.filter.bitset); err != nil {
 		return fmt.Errorf("failed to write bloom filter: %w", err)
 	}
-	if err := binary.Write(file, binary.LittleEndian, uint64(s.filter.m)); err != nil {
+
+	var m64, k64 uint64 = uint64(s.filter.m), uint64(s.filter.k)
+	if err := binary.Write(file, binary.LittleEndian, m64); err != nil {
 		return fmt.Errorf("failed to write bloom filter size: %w", err)
 	}
-	if err := binary.Write(file, binary.LittleEndian, uint64(s.filter.k)); err != nil {
+	if err := binary.Write(file, binary.LittleEndian, k64); err != nil {
 		return fmt.Errorf("failed to write bloom filter hash count: %w", err)
 	}
 
@@ -152,11 +144,16 @@ func (s *SSTable) Write(kvs [][2]string) error {
 }
 
 func (s *SSTable) Load() error {
-	file, err := os.Open(s.path)
+	f, err := os.Open(s.path)
 	if err != nil {
 		return fmt.Errorf("failed to open SSTable: %w", err)
 	}
-	defer file.Close()
+	file := f
+	defer func() {
+		if file != nil {
+			_ = file.Close()
+		}
+	}()
 
 	stat, err := file.Stat()
 	if err != nil {
@@ -205,14 +202,14 @@ func (s *SSTable) Load() error {
 	if err := binary.Read(file, binary.LittleEndian, &k64); err != nil {
 		return fmt.Errorf("failed to read bloom k: %w", err)
 	}
-	s.filter = &BloomFilter{bitset: bits, m: uint(m64), k: uint(k64)}
+	filter := &BloomFilter{bitset: bits, m: uint(m64), k: uint(k64)}
 
 	_, err = file.Seek(indexOffset, io.SeekStart)
 	if err != nil {
 		return fmt.Errorf("failed to seek to index: %w", err)
 	}
 
-	s.index = nil
+	var index []indexEntry
 	for {
 		key, err := readString(file)
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -227,11 +224,51 @@ func (s *SSTable) Load() error {
 			return fmt.Errorf("failed to read index offset: %w", err)
 		}
 
-		s.index = append(s.index, indexEntry{
+		index = append(index, indexEntry{
 			key:    key,
 			offset: offset,
 		})
 	}
 
+	s.file = file
+	s.filter = filter
+	s.index = index
+	file = nil
+
 	return nil
+}
+
+func (s *SSTable) Close() error {
+	if s.file == nil {
+		return nil
+	}
+	err := s.file.Close()
+	s.file = nil
+	return err
+}
+
+func readKVAt(f *os.File, off int64) (key, val string, ok bool) {
+	k, next, ok := readStringAt(f, off)
+	if !ok {
+		return "", "", false
+	}
+	v, _, ok := readStringAt(f, next)
+	if !ok {
+		return "", "", false
+	}
+	return k, v, true
+}
+
+func readStringAt(f *os.File, off int64) (string, int64, bool) {
+	lenBuf := make([]byte, 4)
+	if _, err := f.ReadAt(lenBuf, off); err != nil {
+		return "", 0, false
+	}
+	length := int(binary.LittleEndian.Uint32(lenBuf))
+
+	buf := make([]byte, length)
+	if _, err := f.ReadAt(buf, off+4); err != nil {
+		return "", 0, false
+	}
+	return string(buf), off + 4 + int64(length), true
 }

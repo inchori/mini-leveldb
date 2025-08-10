@@ -29,7 +29,7 @@ func (bf *BloomFilter) Add(data string) {
 	}
 }
 
-func (bf *BloomFilter) MightContains(data string) bool {
+func (bf *BloomFilter) MayContain(data string) bool {
 	for i := uint(0); i < bf.k; i++ {
 		pos := bf.hash(data, i) % bf.m
 		if (bf.bitset[pos/8] & (1 << (pos % 8))) == 0 {

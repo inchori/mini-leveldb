@@ -141,10 +141,19 @@ func (db *DB) Flush() error {
 }
 
 func (db *DB) Close() error {
-	if err := db.wal.Close(); err != nil {
-		return fmt.Errorf("failed to close WAL: %w", err)
+	var firstErr error
+	for _, sst := range db.sstables {
+		if sst != nil {
+			if err := sst.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
 	}
-	return nil
+
+	if err := db.wal.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
 }
 
 func fileSync(path string) error {
