@@ -42,7 +42,9 @@ func NewDB(dir string) (*DB, error) {
 	for _, f := range files {
 		sst := &SSTable{path: f}
 		if err := sst.Load(); err != nil {
-			return nil, fmt.Errorf("failed to load SSTable %s: %w", f, err)
+			// Skip corrupted or invalid SSTable and log the error
+			log.Printf("Skipping SSTable %s due to load error: %v", f, err)
+			continue
 		}
 		db.sstables = append(db.sstables, sst)
 	}

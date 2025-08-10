@@ -179,6 +179,18 @@ func (s *SSTable) Load() error {
 		return fmt.Errorf("failed to read filter offset: %w", err)
 	}
 
+	fileSize := stat.Size()
+	footerStart := fileSize - 16
+	if indexOffset < 0 || filterOffset < 0 {
+		return fmt.Errorf("invalid negative offset in SSTable: %s", s.path)
+	}
+	if indexOffset > footerStart || filterOffset > footerStart {
+		return fmt.Errorf("offset points beyond footer region in SSTable: %s", s.path)
+	}
+	if filterOffset >= indexOffset {
+		return fmt.Errorf("filterOffset must be < indexOffset in SSTable: %s", s.path)
+	}
+
 	if _, err := file.Seek(filterOffset, io.SeekStart); err != nil {
 		return fmt.Errorf("failed to seek to bloom filter: %w", err)
 	}
