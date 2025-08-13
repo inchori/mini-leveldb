@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 )
@@ -17,7 +16,7 @@ type WAL struct {
 }
 
 func walFilePath(dir string) string {
-	return filepath.Join(dir, "wal.log")
+	return filepath.Join(dir, ".walb")
 }
 
 func NewWAL(dir string) (*WAL, error) {
@@ -64,6 +63,7 @@ func Replay(dir string) (map[string]string, error) {
 	defer file.Close()
 
 	replayData := make(map[string]string)
+	var errors []error
 
 	for {
 		key, value, err := readBinaryRecord(file)
@@ -71,10 +71,14 @@ func Replay(dir string) (map[string]string, error) {
 			break
 		}
 		if err != nil {
-			log.Printf("invalid WAL entry, skipping: %v", err)
+			errors = append(errors, fmt.Errorf("invalid WAL entry: %w", err))
 			continue
 		}
 		replayData[key] = value
+	}
+
+	if len(errors) > 0 {
+		return replayData, fmt.Errorf("failed to replay WAL: %v", errors)
 	}
 
 	return replayData, nil
@@ -108,6 +112,9 @@ func (w *WAL) writeBinaryRecord(key, value string) error {
 
 	if err := w.writer.Flush(); err != nil {
 		return fmt.Errorf("failed to flush WAL writer: %w", err)
+	}
+	if err := w.file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync WAL file: %w", err)
 	}
 
 	return nil
