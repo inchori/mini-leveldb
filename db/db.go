@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -70,6 +71,45 @@ func (db *DB) Get(key string) (string, error) {
 	return "", fmt.Errorf("failed to get key %s: not found", key)
 }
 
+type GetResult struct {
+	Value string
+	Error error
+}
+
+func (db *DB) GetBatch(keys []string) []GetResult {
+	results := make([]GetResult, len(keys))
+
+	for i, key := range keys {
+		value, err := db.Get(key)
+		results[i] = GetResult{
+			Value: value,
+			Error: err,
+		}
+	}
+
+	return results
+}
+
+func (db *DB) GetBatchParallel(keys []string) []GetResult {
+	results := make([]GetResult, len(keys))
+	var wg sync.WaitGroup
+
+	for i, key := range keys {
+		wg.Add(1)
+		go func(index int, k string) {
+			defer wg.Done()
+			value, err := db.Get(k)
+			results[index] = GetResult{
+				Value: value,
+				Error: err,
+			}
+		}(i, key)
+	}
+
+	wg.Wait()
+	return results
+}
+
 func (db *DB) Put(key, value string) error {
 	if key == "" {
 		return fmt.Errorf("failed to put key %s: key cannot be empty", key)
@@ -80,6 +120,28 @@ func (db *DB) Put(key, value string) error {
 	}
 
 	db.memTable[key] = value
+	return nil
+}
+
+func (db *DB) PutBatch(kvs [][2]string) error {
+	if len(kvs) == 0 {
+		return nil
+	}
+
+	for _, kv := range kvs {
+		if kv[0] == "" {
+			return fmt.Errorf("failed to put batch: key cannot be empty")
+		}
+	}
+
+	if err := db.wal.AppendBatch(kvs); err != nil {
+		return fmt.Errorf("failed to append batch to WAL: %w", err)
+	}
+
+	for _, kv := range kvs {
+		db.memTable[kv[0]] = kv[1]
+	}
+
 	return nil
 }
 

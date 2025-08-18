@@ -42,6 +42,27 @@ func (w *WAL) Append(key, value string) error {
 	return w.writeBinaryRecord(key, value)
 }
 
+func (w *WAL) AppendBatch(kvs [][2]string) error {
+	if w.writer == nil {
+		return os.ErrInvalid
+	}
+
+	for _, kv := range kvs {
+		if err := w.writeBinaryRecordNoSync(kv[0], kv[1]); err != nil {
+			return fmt.Errorf("failed to write batch record: %w", err)
+		}
+	}
+
+	if err := w.writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush batch: %w", err)
+	}
+	if err := w.file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync batch: %w", err)
+	}
+
+	return nil
+}
+
 func (w *WAL) Close() error {
 	if err := w.writer.Flush(); err != nil {
 		return fmt.Errorf("failed to flush WAL writer on close: %w", err)
@@ -115,6 +136,35 @@ func (w *WAL) writeBinaryRecord(key, value string) error {
 	}
 	if err := w.file.Sync(); err != nil {
 		return fmt.Errorf("failed to sync WAL file: %w", err)
+	}
+
+	return nil
+}
+
+func (w *WAL) writeBinaryRecordNoSync(key, value string) error {
+	if w.writer == nil {
+		return os.ErrInvalid
+	}
+
+	keyBytes := []byte(key)
+	valueBytes := []byte(value)
+
+	data := make([]byte, 4+len(keyBytes)+4+len(valueBytes))
+	binary.LittleEndian.PutUint32(data[0:4], uint32(len(keyBytes)))
+	copy(data[4:4+len(keyBytes)], keyBytes)
+	binary.LittleEndian.PutUint32(data[4+len(keyBytes):8+len(keyBytes)], uint32(len(valueBytes)))
+	copy(data[8+len(keyBytes):], valueBytes)
+
+	crc := crc32.ChecksumIEEE(data)
+
+	if err := binary.Write(w.writer, binary.LittleEndian, uint32(len(data))); err != nil {
+		return fmt.Errorf("failed to write record length: %w", err)
+	}
+	if err := binary.Write(w.writer, binary.LittleEndian, crc); err != nil {
+		return fmt.Errorf("failed to write CRC: %w", err)
+	}
+	if _, err := w.writer.Write(data); err != nil {
+		return fmt.Errorf("failed to write data: %w", err)
 	}
 
 	return nil
