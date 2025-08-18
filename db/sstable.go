@@ -262,32 +262,6 @@ func (s *SSTable) readKVFromMmap(off int64) (key, val string, ok bool) {
 	return k, v, true
 }
 
-func readKVAt(f *os.File, off int64) (key, val string, ok bool) {
-	k, next, ok := readStringAt(f, off)
-	if !ok {
-		return "", "", false
-	}
-	v, _, ok := readStringAt(f, next)
-	if !ok {
-		return "", "", false
-	}
-	return k, v, true
-}
-
-func readStringAt(f *os.File, off int64) (string, int64, bool) {
-	lenBuf := make([]byte, 4)
-	if _, err := f.ReadAt(lenBuf, off); err != nil {
-		return "", 0, false
-	}
-	length := int(binary.LittleEndian.Uint32(lenBuf))
-
-	buf := make([]byte, length)
-	if _, err := f.ReadAt(buf, off+4); err != nil {
-		return "", 0, false
-	}
-	return string(buf), off + 4 + int64(length), true
-}
-
 func readBytesFromMmap(data []byte, offset int) ([]byte, int, error) {
 	if offset+4 > len(data) {
 		return nil, 0, fmt.Errorf("insufficient data for length prefix")
