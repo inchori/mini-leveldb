@@ -67,7 +67,7 @@ func (s *SSTable) BinarySearch(key string) (string, bool) {
 	}
 	off := s.index[i].offset
 
-	k, v, ok := readKVAt(s.file, off)
+	k, v, ok := s.readKVFromMmap(off)
 	if !ok || k != key {
 		return "", false
 	}
@@ -242,6 +242,24 @@ func (s *SSTable) Close() error {
 	}
 
 	return firstErr
+}
+
+func (s *SSTable) readKVFromMmap(off int64) (key, val string, ok bool) {
+	if s.mmap == nil || off < 0 || int(off) >= len(s.mmap) {
+		return "", "", false
+	}
+
+	k, nextOffset, err := readStringFromMmap(s.mmap, int(off))
+	if err != nil {
+		return "", "", false
+	}
+
+	v, _, err := readStringFromMmap(s.mmap, nextOffset)
+	if err != nil {
+		return "", "", false
+	}
+
+	return k, v, true
 }
 
 func readKVAt(f *os.File, off int64) (key, val string, ok bool) {
