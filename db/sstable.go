@@ -3,12 +3,13 @@ package db
 import (
 	"bufio"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sort"
 	"strings"
+
+	"github.com/edsrzf/mmap-go"
 )
 
 type indexEntry struct {
@@ -21,6 +22,7 @@ type SSTable struct {
 	index  []indexEntry
 	filter *BloomFilter
 	file   *os.File
+	mmap   mmap.MMap
 }
 
 func (s *SSTable) LinearSearch(key string) (string, bool) {
@@ -144,16 +146,17 @@ func (s *SSTable) Write(kvs [][2]string) error {
 }
 
 func (s *SSTable) Load() error {
-	f, err := os.Open(s.path)
+	file, err := os.Open(s.path)
 	if err != nil {
 		return fmt.Errorf("failed to open SSTable: %w", err)
 	}
-	file := f
-	defer func() {
-		if file != nil {
-			_ = file.Close()
-		}
-	}()
+	s.file = file
+
+	mmapData, err := mmap.Map(file, mmap.RDONLY, 0)
+	if err != nil {
+		return fmt.Errorf("failed to mmap SSTable: %w", err)
+	}
+	s.mmap = mmapData
 
 	stat, err := file.Stat()
 	if err != nil {
@@ -163,88 +166,82 @@ func (s *SSTable) Load() error {
 		return fmt.Errorf("SSTable file is too small: %s", s.path)
 	}
 
-	_, err = file.Seek(-16, io.SeekEnd)
-	if err != nil {
-		return fmt.Errorf("failed to seek to footer: %w", err)
-	}
-
-	var indexOffset, filterOffset int64
-	if err := binary.Read(file, binary.LittleEndian, &indexOffset); err != nil {
-		return fmt.Errorf("failed to read index offset: %w", err)
-	}
-	if err := binary.Read(file, binary.LittleEndian, &filterOffset); err != nil {
-		return fmt.Errorf("failed to read filter offset: %w", err)
-	}
+	footerStart := len(s.mmap) - 16
+	indexOffset := int64(binary.LittleEndian.Uint64(s.mmap[footerStart : footerStart+8]))
+	filterOffset := int64(binary.LittleEndian.Uint64(s.mmap[footerStart+8 : footerStart+16]))
 
 	fileSize := stat.Size()
-	footerStart := fileSize - 16
+	footerPos := fileSize - 16
 	if indexOffset < 0 || filterOffset < 0 {
 		return fmt.Errorf("invalid negative offset in SSTable: %s", s.path)
 	}
-	if indexOffset > footerStart || filterOffset > footerStart {
+	if indexOffset > footerPos || filterOffset > footerPos {
 		return fmt.Errorf("offset points beyond footer region in SSTable: %s", s.path)
 	}
 	if filterOffset >= indexOffset {
 		return fmt.Errorf("filterOffset must be < indexOffset in SSTable: %s", s.path)
 	}
 
-	if _, err := file.Seek(filterOffset, io.SeekStart); err != nil {
-		return fmt.Errorf("failed to seek to bloom filter: %w", err)
-	}
-	bits, err := readBytes(file)
+	bits, offset, err := readBytesFromMmap(s.mmap, int(filterOffset))
 	if err != nil {
 		return fmt.Errorf("failed to read bloom bits: %w", err)
 	}
-	var m64, k64 uint64
-	if err := binary.Read(file, binary.LittleEndian, &m64); err != nil {
-		return fmt.Errorf("failed to read bloom m: %w", err)
+
+	if offset+16 > len(s.mmap) {
+		return fmt.Errorf("insufficient data for bloom filter metadata")
 	}
-	if err := binary.Read(file, binary.LittleEndian, &k64); err != nil {
-		return fmt.Errorf("failed to read bloom k: %w", err)
-	}
+
+	m64 := binary.LittleEndian.Uint64(s.mmap[offset : offset+8])
+	k64 := binary.LittleEndian.Uint64(s.mmap[offset+8 : offset+16])
 	filter := &BloomFilter{bitset: bits, m: uint(m64), k: uint(k64)}
 
-	_, err = file.Seek(indexOffset, io.SeekStart)
-	if err != nil {
-		return fmt.Errorf("failed to seek to index: %w", err)
-	}
-
 	var index []indexEntry
-	for {
-		key, err := readString(file)
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+	currentOffset := int(indexOffset)
+
+	for currentOffset < len(s.mmap)-16 {
+		key, newOffset, err := readStringFromMmap(s.mmap, currentOffset)
+		if err != nil {
 			break
 		}
-		if err != nil {
-			return fmt.Errorf("failed to read index key: %w", err)
+
+		if newOffset+8 > len(s.mmap)-16 {
+			break
 		}
 
-		var offset int64
-		if err := binary.Read(file, binary.LittleEndian, &offset); err != nil {
-			return fmt.Errorf("failed to read index offset: %w", err)
-		}
+		entryOffset := int64(binary.LittleEndian.Uint64(s.mmap[newOffset : newOffset+8]))
+		currentOffset = newOffset + 8
 
 		index = append(index, indexEntry{
 			key:    key,
-			offset: offset,
+			offset: entryOffset,
 		})
 	}
 
 	s.file = file
 	s.filter = filter
 	s.index = index
-	file = nil
 
 	return nil
 }
 
 func (s *SSTable) Close() error {
-	if s.file == nil {
-		return nil
+	var firstErr error
+
+	if s.mmap != nil {
+		if err := s.mmap.Unmap(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		s.mmap = nil
 	}
-	err := s.file.Close()
-	s.file = nil
-	return err
+
+	if s.file != nil {
+		if err := s.file.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		s.file = nil
+	}
+
+	return firstErr
 }
 
 func readKVAt(f *os.File, off int64) (key, val string, ok bool) {
@@ -271,4 +268,39 @@ func readStringAt(f *os.File, off int64) (string, int64, bool) {
 		return "", 0, false
 	}
 	return string(buf), off + 4 + int64(length), true
+}
+
+func readBytesFromMmap(data []byte, offset int) ([]byte, int, error) {
+	if offset+4 > len(data) {
+		return nil, 0, fmt.Errorf("insufficient data for length prefix")
+	}
+
+	length := int(binary.LittleEndian.Uint32(data[offset : offset+4]))
+	newOffset := offset + 4
+
+	if newOffset+length > len(data) {
+		return nil, 0, fmt.Errorf("insufficient data for bytes payload")
+	}
+
+	result := make([]byte, length)
+	copy(result, data[newOffset:newOffset+length])
+
+	return result, newOffset + length, nil
+}
+
+func readStringFromMmap(data []byte, offset int) (string, int, error) {
+	if offset+4 > len(data) {
+		return "", 0, fmt.Errorf("insufficient data for length prefix")
+	}
+
+	length := int(binary.LittleEndian.Uint32(data[offset : offset+4]))
+	newOffset := offset + 4
+
+	if newOffset+length > len(data) {
+		return "", 0, fmt.Errorf("insufficient data for string payload")
+	}
+
+	result := string(data[newOffset : newOffset+length])
+
+	return result, newOffset + length, nil
 }

@@ -56,7 +56,7 @@ func Replay(dir string) (map[string]string, error) {
 	file, err := os.OpenFile(filePath, os.O_RDONLY, 0644)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return map[string]string{}, nil // WAL 파일 없는 건 정상
+			return map[string]string{}, nil
 		}
 		return nil, fmt.Errorf("failed to open WAL file for replay: %w", err)
 	}
