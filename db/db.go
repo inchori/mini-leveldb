@@ -11,10 +11,11 @@ import (
 )
 
 type DB struct {
-	memTable map[string]string
-	wal      *WAL
-	sstables []*SSTable
-	dir      string
+	memTable        map[string]string
+	wal             *WAL
+	sstables        []*SSTable
+	dir             string
+	compactionLimit int
 }
 
 func NewDB(dir string) (*DB, error) {
@@ -29,9 +30,10 @@ func NewDB(dir string) (*DB, error) {
 	}
 
 	db := &DB{
-		memTable: memTable,
-		wal:      wal,
-		dir:      dir,
+		memTable:        memTable,
+		wal:             wal,
+		dir:             dir,
+		compactionLimit: 5,
 	}
 
 	files, err := filepath.Glob(filepath.Join(dir, "*.sst"))
@@ -199,6 +201,12 @@ func (db *DB) Flush() error {
 
 	log.Printf("Flushed %d entries to SSTable", len(kvs))
 
+	if len(db.sstables) >= db.compactionLimit {
+		if err := db.compact(); err != nil {
+			log.Printf("Compaction failed: %v", err)
+		}
+	}
+
 	return nil
 }
 
@@ -216,6 +224,96 @@ func (db *DB) Close() error {
 		firstErr = err
 	}
 	return firstErr
+}
+
+func (db *DB) compact() error {
+	if len(db.sstables) < 2 {
+		return nil
+	}
+
+	log.Printf("Starting compaction with %d SSTable files", len(db.sstables))
+
+	mergeCount := len(db.sstables) / 2
+	if mergeCount < 2 {
+		mergeCount = 2
+	}
+
+	toMerge := db.sstables[:mergeCount]
+	remaining := db.sstables[mergeCount:]
+
+	allKVs := make(map[string]string)
+
+	for _, sst := range toMerge {
+		kvs, err := db.extractAllKVsFromSSTable(sst)
+		if err != nil {
+			return fmt.Errorf("failed to extract KVs from SSTable: %w", err)
+		}
+		for _, kv := range kvs {
+			allKVs[kv[0]] = kv[1]
+		}
+	}
+
+	sortedKVs := make([][2]string, 0, len(allKVs))
+	keys := make([]string, 0, len(allKVs))
+	for k := range allKVs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		sortedKVs = append(sortedKVs, [2]string{k, allKVs[k]})
+	}
+
+	filename := fmt.Sprintf("sstable_compacted_%d.sst", time.Now().UnixNano())
+	sstablePath := filepath.Join(db.dir, filename)
+	tmpPath := sstablePath + ".tmp"
+
+	newSST := &SSTable{path: tmpPath}
+	if err := newSST.Write(sortedKVs); err != nil {
+		return fmt.Errorf("failed to write compacted SSTable: %w", err)
+	}
+
+	if err := fileSync(tmpPath); err != nil {
+		return fmt.Errorf("failed to sync compacted SSTable: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, sstablePath); err != nil {
+		return fmt.Errorf("failed to rename compacted SSTable: %w", err)
+	}
+
+	newSST.path = sstablePath
+	if err := newSST.Load(); err != nil {
+		return fmt.Errorf("failed to load compacted SSTable: %w", err)
+	}
+
+	for _, sst := range toMerge {
+		if err := sst.Close(); err != nil {
+			log.Printf("Warning: failed to close SSTable during compaction: %v", err)
+		}
+		if err := os.Remove(sst.path); err != nil {
+			log.Printf("Warning: failed to remove old SSTable file: %v", err)
+		}
+	}
+
+	db.sstables = append([]*SSTable{newSST}, remaining...)
+
+	log.Printf("Compaction completed: merged %d files into 1, %d files remaining",
+		mergeCount, len(db.sstables))
+
+	return nil
+}
+
+func (db *DB) extractAllKVsFromSSTable(sst *SSTable) ([][2]string, error) {
+	var kvs [][2]string
+
+	for _, entry := range sst.index {
+		key, value, ok := sst.readKVFromMmap(entry.offset)
+		if !ok {
+			continue
+		}
+		kvs = append(kvs, [2]string{key, value})
+	}
+
+	return kvs, nil
 }
 
 func fileSync(path string) error {
