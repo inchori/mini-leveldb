@@ -134,7 +134,6 @@ func (s *SSTable) Write(kvs [][2]string) error {
 		}
 	}
 
-	// Write the footer with index and filter offsets
 	if err := binary.Write(file, binary.LittleEndian, indexOffset); err != nil {
 		return fmt.Errorf("failed to write footer: %w", err)
 	}

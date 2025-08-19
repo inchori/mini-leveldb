@@ -10,12 +10,17 @@ import (
 	"time"
 )
 
+type LevelPolicy struct {
+	maxFiles int
+	maxSize  int64
+}
+
 type DB struct {
-	memTable        map[string]string
-	wal             *WAL
-	sstables        []*SSTable
-	dir             string
-	compactionLimit int
+	memTable      map[string]string
+	wal           *WAL
+	levels        [][]*SSTable
+	dir           string
+	levelPolicies []LevelPolicy
 }
 
 func NewDB(dir string) (*DB, error) {
@@ -30,10 +35,19 @@ func NewDB(dir string) (*DB, error) {
 	}
 
 	db := &DB{
-		memTable:        memTable,
-		wal:             wal,
-		dir:             dir,
-		compactionLimit: 5,
+		memTable: memTable,
+		wal:      wal,
+		levels:   make([][]*SSTable, 7),
+		dir:      dir,
+		levelPolicies: []LevelPolicy{
+			{maxFiles: 4, maxSize: 0},
+			{maxFiles: 10, maxSize: 10 * 1024 * 1024},
+			{maxFiles: 10, maxSize: 100 * 1024 * 1024},
+			{maxFiles: 10, maxSize: 1000 * 1024 * 1024},
+			{maxFiles: 10, maxSize: 10000 * 1024 * 1024},
+			{maxFiles: 10, maxSize: 100000 * 1024 * 1024},
+			{maxFiles: 10, maxSize: 1000000 * 1024 * 1024},
+		},
 	}
 
 	files, err := filepath.Glob(filepath.Join(dir, "*.sst"))
@@ -45,11 +59,10 @@ func NewDB(dir string) (*DB, error) {
 	for _, f := range files {
 		sst := &SSTable{path: f}
 		if err := sst.Load(); err != nil {
-			// Skip corrupted or invalid SSTable and log the error
 			log.Printf("Skipping SSTable %s due to load error: %v", f, err)
 			continue
 		}
-		db.sstables = append(db.sstables, sst)
+		db.levels[0] = append(db.levels[0], sst)
 	}
 
 	return db, nil
@@ -60,14 +73,35 @@ func (db *DB) Get(key string) (string, error) {
 		return value, nil
 	}
 
-	for i := len(db.sstables) - 1; i >= 0; i-- {
-		sst := db.sstables[i]
-		if sst == nil || len(sst.index) == 0 {
-			continue
-		}
+	for levelNum := 0; levelNum < len(db.levels); levelNum++ {
+		level := db.levels[levelNum]
 
-		if value, ok := db.sstables[i].BinarySearch(key); ok {
-			return value, nil
+		if levelNum == 0 {
+			for i := len(level) - 1; i >= 0; i-- {
+				sst := level[i]
+				if sst == nil || len(sst.index) == 0 {
+					continue
+				}
+				if value, ok := sst.BinarySearch(key); ok {
+					return value, nil
+				}
+			}
+		} else {
+			for _, sst := range level {
+				if sst == nil || len(sst.index) == 0 {
+					continue
+				}
+
+				firstKey := sst.index[0].key
+				lastKey := sst.index[len(sst.index)-1].key
+
+				if key >= firstKey && key <= lastKey {
+					if value, ok := sst.BinarySearch(key); ok {
+						return value, nil
+					}
+					break
+				}
+			}
 		}
 	}
 	return "", fmt.Errorf("failed to get key %s: not found", key)
@@ -197,14 +231,12 @@ func (db *DB) Flush() error {
 	}
 	db.wal = newWal
 	db.memTable = make(map[string]string)
-	db.sstables = append(db.sstables, sst)
+	db.levels[0] = append(db.levels[0], sst)
 
 	log.Printf("Flushed %d entries to SSTable", len(kvs))
 
-	if len(db.sstables) >= db.compactionLimit {
-		if err := db.compact(); err != nil {
-			log.Printf("Compaction failed: %v", err)
-		}
+	if err := db.maybeCompact(); err != nil {
+		log.Printf("Compaction failed: %v", err)
 	}
 
 	return nil
@@ -212,10 +244,13 @@ func (db *DB) Flush() error {
 
 func (db *DB) Close() error {
 	var firstErr error
-	for _, sst := range db.sstables {
-		if sst != nil {
-			if err := sst.Close(); err != nil && firstErr == nil {
-				firstErr = err
+
+	for _, level := range db.levels {
+		for _, sst := range level {
+			if sst != nil {
+				if err := sst.Close(); err != nil && firstErr == nil {
+					firstErr = err
+				}
 			}
 		}
 	}
@@ -226,30 +261,67 @@ func (db *DB) Close() error {
 	return firstErr
 }
 
-func (db *DB) compact() error {
-	if len(db.sstables) < 2 {
-		return nil
+func (db *DB) maybeCompact() error {
+	for level := 0; level < len(db.levels)-1; level++ {
+		if db.needsCompaction(level) {
+			if err := db.compactLevel(level); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (db *DB) needsCompaction(level int) bool {
+	policy := db.levelPolicies[level]
+	levelFiles := db.levels[level]
+
+	if len(levelFiles) >= policy.maxFiles {
+		return true
 	}
 
-	log.Printf("Starting compaction with %d SSTable files", len(db.sstables))
-
-	mergeCount := len(db.sstables) / 2
-	if mergeCount < 2 {
-		mergeCount = 2
+	if policy.maxSize > 0 {
+		totalSize := int64(0)
+		for _, sst := range levelFiles {
+			if sst != nil && sst.file != nil {
+				if stat, err := sst.file.Stat(); err == nil {
+					totalSize += stat.Size()
+				}
+			}
+		}
+		if totalSize >= policy.maxSize {
+			return true
+		}
 	}
 
-	toMerge := db.sstables[:mergeCount]
-	remaining := db.sstables[mergeCount:]
+	return false
+}
+
+func (db *DB) compactLevel(level int) error {
+	nextLevel := level + 1
+	log.Printf("Starting L%d→L%d compaction", level, nextLevel)
 
 	allKVs := make(map[string]string)
 
-	for _, sst := range toMerge {
+	for _, sst := range db.levels[level] {
 		kvs, err := db.extractAllKVsFromSSTable(sst)
 		if err != nil {
-			return fmt.Errorf("failed to extract KVs from SSTable: %w", err)
+			return fmt.Errorf("failed to extract KVs from L%d SSTable: %w", level, err)
 		}
 		for _, kv := range kvs {
 			allKVs[kv[0]] = kv[1]
+		}
+	}
+
+	for _, sst := range db.levels[nextLevel] {
+		kvs, err := db.extractAllKVsFromSSTable(sst)
+		if err != nil {
+			return fmt.Errorf("failed to extract KVs from L%d SSTable: %w", nextLevel, err)
+		}
+		for _, kv := range kvs {
+			if _, exists := allKVs[kv[0]]; !exists {
+				allKVs[kv[0]] = kv[1]
+			}
 		}
 	}
 
@@ -263,41 +335,51 @@ func (db *DB) compact() error {
 		sortedKVs = append(sortedKVs, [2]string{k, allKVs[k]})
 	}
 
-	filename := fmt.Sprintf("sstable_compacted_%d.sst", time.Now().UnixNano())
+	filename := fmt.Sprintf("sstable_l%d_%d.sst", nextLevel, time.Now().UnixNano())
 	sstablePath := filepath.Join(db.dir, filename)
 	tmpPath := sstablePath + ".tmp"
 
 	newSST := &SSTable{path: tmpPath}
 	if err := newSST.Write(sortedKVs); err != nil {
-		return fmt.Errorf("failed to write compacted SSTable: %w", err)
+		return fmt.Errorf("failed to write L%d SSTable: %w", nextLevel, err)
 	}
 
 	if err := fileSync(tmpPath); err != nil {
-		return fmt.Errorf("failed to sync compacted SSTable: %w", err)
+		return fmt.Errorf("failed to sync L%d SSTable: %w", nextLevel, err)
 	}
 
 	if err := os.Rename(tmpPath, sstablePath); err != nil {
-		return fmt.Errorf("failed to rename compacted SSTable: %w", err)
+		return fmt.Errorf("failed to rename L%d SSTable: %w", nextLevel, err)
 	}
 
 	newSST.path = sstablePath
 	if err := newSST.Load(); err != nil {
-		return fmt.Errorf("failed to load compacted SSTable: %w", err)
+		return fmt.Errorf("failed to load L%d SSTable: %w", nextLevel, err)
 	}
 
-	for _, sst := range toMerge {
+	for _, sst := range db.levels[level] {
 		if err := sst.Close(); err != nil {
-			log.Printf("Warning: failed to close SSTable during compaction: %v", err)
+			log.Printf("Warning: failed to close L%d SSTable: %v", level, err)
 		}
 		if err := os.Remove(sst.path); err != nil {
-			log.Printf("Warning: failed to remove old SSTable file: %v", err)
+			log.Printf("Warning: failed to remove L%d file: %v", level, err)
 		}
 	}
 
-	db.sstables = append([]*SSTable{newSST}, remaining...)
+	for _, sst := range db.levels[nextLevel] {
+		if err := sst.Close(); err != nil {
+			log.Printf("Warning: failed to close L%d SSTable: %v", nextLevel, err)
+		}
+		if err := os.Remove(sst.path); err != nil {
+			log.Printf("Warning: failed to remove L%d file: %v", nextLevel, err)
+		}
+	}
 
-	log.Printf("Compaction completed: merged %d files into 1, %d files remaining",
-		mergeCount, len(db.sstables))
+	db.levels[level] = nil
+	db.levels[nextLevel] = []*SSTable{newSST}
+
+	log.Printf("L%d→L%d compaction completed: all data moved to L%d (%d keys)",
+		level, nextLevel, nextLevel, len(sortedKVs))
 
 	return nil
 }
