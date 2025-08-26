@@ -1,6 +1,6 @@
 # mini-leveldb
 
-An educational implementation of LevelDB in Go. Learn how LSM trees, compaction, and storage engines work by exploring a clean, well-structured codebase.
+An implementation of minimal LevelDB in Go. Learn how LSM trees, compaction, and storage engines work by exploring a clean, well-structured codebase.
 
 ## What You'll Learn
 
